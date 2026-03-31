@@ -1,0 +1,28 @@
+# Go
+daemon/vendor/
+daemon/*.exe
+daemon/daemon
+daemon/__debug_bin*
+
+# Node / pnpm
+node_modules/
+canvas/node_modules/
+extension/node_modules/
+canvas/dist/
+extension/dist/
+
+# Build outputs
+*.out
+*.test
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Repomix outputs (keep config, exclude output files)
+repomix-output*.xml
+repomix-output*.md
+repomix-output*.txt
+
+# Logs
+*.log
