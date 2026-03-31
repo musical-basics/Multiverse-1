@@ -13,6 +13,7 @@ import CommitNode from './CommitNode';
 import { buildGraphElements } from './layout';
 import AgentHaltToast from './AgentHaltToast';
 import IntentModal from './IntentModal';
+import MergeConfirmModal from './MergeConfirmModal';
 
 const DAEMON_URL = 'http://localhost:4444';
 const WS_URL = 'ws://localhost:4444/ws';
@@ -34,6 +35,10 @@ export default function App() {
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [agentHalt, setAgentHalt] = useState<{ visible: boolean; error?: string }>({ visible: false });
   const [pendingBranch, setPendingBranch] = useState<{ sourceNodeId: string; sourceHash: string } | null>(null);
+  const [pendingMerge, setPendingMerge] = useState<{
+    sourceId: string; sourceHash: string;
+    targetId: string; targetHash: string;
+  } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
   // Scrap It: POST /reset → git reset --hard
@@ -52,8 +57,26 @@ export default function App() {
     setEdges((eds) => addEdge({ ...connection, animated: true, style: { stroke: '#4ade80', strokeWidth: 2 } }, eds));
   }, [setEdges]);
 
-  // Double-click node → Time Travel (POST /switch)
+  // Double-click node → Time Travel (POST /switch) OR Alley-Oop for conflicted nodes
   const onNodeDoubleClick = useCallback(async (_: React.MouseEvent, node: Node) => {
+    const nodeStatus = (node.data as { status?: string })?.status;
+
+    // Alley-Oop: clicking a conflicted Synthesis node shifts workspace to Crucible
+    if (nodeStatus === 'conflicted') {
+      try {
+        await fetch(`${DAEMON_URL}/switch`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ node_id: node.id }),
+        });
+        console.log('Alley-Oop → shifted to Crucible for conflict resolution');
+      } catch (e) {
+        console.error('Alley-Oop failed:', e);
+      }
+      return;
+    }
+
+    // Standard Time Travel
     try {
       const res = await fetch(`${DAEMON_URL}/switch`, {
         method: 'POST',
@@ -87,6 +110,27 @@ export default function App() {
       setPendingBranch(null);
     }
   }, [pendingBranch]);
+
+  // Execute merge: POST /merge with source and target hashes
+  const handleMerge = useCallback(async () => {
+    if (!pendingMerge) return;
+    try {
+      await fetch(`${DAEMON_URL}/merge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source_hash: pendingMerge.sourceHash,
+          target_hash: pendingMerge.targetHash,
+          source_id: pendingMerge.sourceId,
+          target_id: pendingMerge.targetId,
+        }),
+      });
+    } catch (e) {
+      console.error('Merge failed:', e);
+    } finally {
+      setPendingMerge(null);
+    }
+  }, [pendingMerge]);
 
   const applyGraph = useCallback((graphData: { nodes: unknown[] }) => {
     if (!graphData?.nodes) return;
@@ -256,8 +300,11 @@ export default function App() {
       {import.meta.env.DEV && (() => {
         // @ts-ignore
         window.__multiverseHalt = (msg?: string) => setAgentHalt({ visible: true, error: msg });
-        // @ts-ignore — expose branch trigger for testing
+        // @ts-ignore
         window.__multiverseBranch = (nodeId: string, hash: string) => setPendingBranch({ sourceNodeId: nodeId, sourceHash: hash });
+        // @ts-ignore
+        window.__multiverseMerge = (sId: string, sHash: string, tId: string, tHash: string) =>
+          setPendingMerge({ sourceId: sId, sourceHash: sHash, targetId: tId, targetHash: tHash });
         return null;
       })()}
 
@@ -268,6 +315,18 @@ export default function App() {
           sourceHash={pendingBranch.sourceHash}
           onConfirm={handleCreateBranch}
           onCancel={() => setPendingBranch(null)}
+        />
+      )}
+
+      {/* Merge Confirm Modal (Crucible synthesis) */}
+      {pendingMerge && (
+        <MergeConfirmModal
+          sourceId={pendingMerge.sourceId}
+          sourceHash={pendingMerge.sourceHash}
+          targetId={pendingMerge.targetId}
+          targetHash={pendingMerge.targetHash}
+          onConfirm={handleMerge}
+          onCancel={() => setPendingMerge(null)}
         />
       )}
     </div>

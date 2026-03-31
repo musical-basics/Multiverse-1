@@ -384,7 +384,198 @@ func main() {
 		})
 	})
 
+	// ── POST /merge — Crucible deterministic merge engine ─────────────────────
+
+	r.POST("/merge", func(c *gin.Context) {
+		var body struct {
+			SourceHash string `json:"source_hash"` // Timeline A (base)
+			TargetHash string `json:"target_hash"` // Timeline B (to merge in)
+			SourceID   string `json:"source_id"`
+			TargetID   string `json:"target_id"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil || body.SourceHash == "" || body.TargetHash == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "source_hash and target_hash are required"})
+			return
+		}
+
+		// Create Crucible worktree from Timeline A
+		crucibleID := uuid.NewString()
+		cruciblesDir := filepath.Join(repoRoot, ".multiverse", "crucibles")
+		if err := os.MkdirAll(cruciblesDir, 0755); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot create crucibles dir"})
+			return
+		}
+		cruciblePath := filepath.Join(cruciblesDir, crucibleID)
+		crucibleBranch := "crucible-" + crucibleID[:8]
+
+		if out, err := executeGit(repoRoot, "worktree", "add", "-b", crucibleBranch, cruciblePath, body.SourceHash); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "crucible worktree creation failed", "detail": out})
+			return
+		}
+
+		// Attempt the merge
+		_, mergeErr := executeGit(cruciblePath, "merge", body.TargetHash, "--no-edit")
+
+		// Find intents for both nodes to build context
+		sourceIntent, targetIntent := "Unknown intent", "Unknown intent"
+		graphMu.RLock()
+		for _, n := range graph.Nodes {
+			if n.GitHash == body.SourceHash || n.NodeID == body.SourceID {
+				sourceIntent = n.IntentPrompt
+			}
+			if n.GitHash == body.TargetHash || n.NodeID == body.TargetID {
+				targetIntent = n.IntentPrompt
+			}
+		}
+		graphMu.RUnlock()
+
+		// Determine parent node for synthesis node
+		parentID := body.SourceID
+		if body.SourceID == "" {
+			parentID = body.TargetID
+		}
+
+		if mergeErr == nil {
+			// ✅ Fast-Forward SUCCESS: commit, clean up Crucible, mark node green
+			if out, err := executeGit(cruciblePath, "commit", "--allow-empty", "-m",
+				fmt.Sprintf("Synthesis: %s ⊕ %s", sourceIntent, targetIntent)); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "merge commit failed", "detail": out})
+				return
+			}
+
+			hash, _ := currentHash(cruciblePath)
+
+			// Remove crucible worktree
+			executeGit(repoRoot, "worktree", "remove", "--force", cruciblePath)
+
+			synthNode := MultiverseNode{
+				NodeID:       uuid.NewString(),
+				GitHash:      hash,
+				ParentID:     parentID,
+				IntentPrompt: fmt.Sprintf("⊕ Synthesis: %s + %s", sourceIntent, targetIntent),
+				Timestamp:    time.Now().UTC().Format(time.RFC3339),
+				WorktreePath: repoRoot,
+				Status:       "synth_ok",
+			}
+			addNode(repoRoot, synthNode)
+			go broadcastGraph()
+
+			c.JSON(http.StatusOK, gin.H{
+				"result":    "success",
+				"node":      synthNode,
+				"message":   "Clean merge — Synthesis Node is green!",
+			})
+			return
+		}
+
+		// ⚠️ CONFLICT: leave Crucible dirty, inject context file, mark node yellow
+		mergeContextMD := fmt.Sprintf(`# Multiverse Merge Conflict Context
+
+You are resolving a Git conflict. **Do not remove features from either intent. Synthesize them.**
+
+- **Target Intent (Timeline A):** "%s"
+- **Source Intent (Timeline B):** "%s"
+
+Resolve all conflict markers in this workspace. When done, delete this file and run git commit.
+`, sourceIntent, targetIntent)
+
+		contextFile := filepath.Join(cruciblePath, ".multiverse_merge.md")
+		os.WriteFile(contextFile, []byte(mergeContextMD), 0644)
+
+		// Register a pending synth node (yellow)
+		synthNodeID := uuid.NewString()
+		synthNode := MultiverseNode{
+			NodeID:       synthNodeID,
+			GitHash:      "pending-" + crucibleID[:8],
+			ParentID:     parentID,
+			IntentPrompt: fmt.Sprintf("⚠ Conflict: %s ⊕ %s", sourceIntent, targetIntent),
+			Timestamp:    time.Now().UTC().Format(time.RFC3339),
+			WorktreePath: cruciblePath,
+			Status:       "conflicted",
+		}
+		addNode(repoRoot, synthNode)
+		go broadcastGraph()
+
+		c.JSON(http.StatusConflict, gin.H{
+			"result":        "conflict",
+			"node":          synthNode,
+			"crucible_path": cruciblePath,
+			"message":       "Conflict detected. Click the yellow node to resolve with your AI agent.",
+		})
+	})
+
+	// ── POST /merge/resolve — finalize conflict resolution ────────────────────
+
+	r.POST("/merge/resolve", func(c *gin.Context) {
+		var body struct {
+			NodeID string `json:"node_id"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil || body.NodeID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "node_id is required"})
+			return
+		}
+
+		// Find the conflicted node
+		graphMu.RLock()
+		var conflictedNode *MultiverseNode
+		for i := range graph.Nodes {
+			if graph.Nodes[i].NodeID == body.NodeID {
+				n := graph.Nodes[i]
+				conflictedNode = &n
+				break
+			}
+		}
+		graphMu.RUnlock()
+
+		if conflictedNode == nil || conflictedNode.Status != "conflicted" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "conflicted node not found"})
+			return
+		}
+
+		cruciblePath := conflictedNode.WorktreePath
+
+		// Check for remaining conflict markers
+		grepOut, _ := executeGit(cruciblePath, "diff", "--name-only", "--diff-filter=U")
+		if len(grepOut) > 0 {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":            "conflict markers still present",
+				"conflicted_files": grepOut,
+			})
+			return
+		}
+
+		// Stage and finalize commit
+		executeGit(cruciblePath, "add", ".")
+		if out, err := executeGit(cruciblePath, "commit", "--no-edit", "-m",
+			fmt.Sprintf("Resolved: %s", conflictedNode.IntentPrompt)); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "commit failed", "detail": out})
+			return
+		}
+
+		hash, _ := currentHash(cruciblePath)
+
+		// Mark node as resolved
+		graphMu.Lock()
+		for i := range graph.Nodes {
+			if graph.Nodes[i].NodeID == body.NodeID {
+				graph.Nodes[i].Status = "synth_ok"
+				graph.Nodes[i].GitHash = hash
+				graph.Nodes[i].IntentPrompt = "✓ " + graph.Nodes[i].IntentPrompt
+			}
+		}
+		graphMu.Unlock()
+		saveGraph(repoRoot)
+		go broadcastGraph()
+
+		c.JSON(http.StatusOK, gin.H{
+			"result":   "resolved",
+			"git_hash": hash,
+			"message":  "Synthesis complete — node is now green!",
+		})
+	})
+
 	// ── GET /ws WebSocket Endpoint ────────────────────────────────────────────
+
 
 	r.GET("/ws", func(c *gin.Context) {
 		ws, err := upgrader.Upgrade(c.Writer, c.Request, nil)
