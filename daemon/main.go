@@ -279,6 +279,111 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"status": "reset", "head": hash})
 	})
 
+	// ── POST /branch — create isolated worktree from a given hash ─────────────
+
+	r.POST("/branch", func(c *gin.Context) {
+		var body struct {
+			SourceHash string `json:"source_hash"`
+			NewIntent  string `json:"new_intent"`
+			ParentID   string `json:"parent_id"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil || body.SourceHash == "" || body.NewIntent == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "source_hash and new_intent are required"})
+			return
+		}
+
+		newID := uuid.NewString()
+		worktreesDir := filepath.Join(repoRoot, ".multiverse", "worktrees")
+		if err := os.MkdirAll(worktreesDir, 0755); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot create worktrees dir"})
+			return
+		}
+		worktreePath := filepath.Join(worktreesDir, newID)
+
+		// Create an isolated worktree at the source hash
+		branchName := "mv-" + newID[:8]
+		if out, err := executeGit(repoRoot, "worktree", "add", "-b", branchName, worktreePath, body.SourceHash); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "git worktree add failed", "detail": out})
+			return
+		}
+
+		hash, _ := currentHash(worktreePath)
+
+		newNode := MultiverseNode{
+			NodeID:       newID,
+			GitHash:      hash,
+			ParentID:     body.ParentID,
+			IntentPrompt: body.NewIntent,
+			Timestamp:    time.Now().UTC().Format(time.RFC3339),
+			WorktreePath: worktreePath,
+			Status:       "inactive",
+		}
+
+		if err := addNode(repoRoot, newNode); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save branch node"})
+			return
+		}
+
+		go broadcastGraph()
+		c.JSON(http.StatusOK, newNode)
+	})
+
+	// ── POST /switch — change active workspace to target worktree ─────────────
+
+	r.POST("/switch", func(c *gin.Context) {
+		var body struct {
+			TargetHash string `json:"target_hash"`
+			NodeID     string `json:"node_id"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil || body.NodeID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "node_id is required"})
+			return
+		}
+
+		// Find the node and its worktree path
+		graphMu.RLock()
+		var targetNode *MultiverseNode
+		for i := range graph.Nodes {
+			if graph.Nodes[i].NodeID == body.NodeID {
+				n := graph.Nodes[i]
+				targetNode = &n
+				break
+			}
+		}
+		graphMu.RUnlock()
+
+		if targetNode == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
+			return
+		}
+
+		// Update status: deactivate all, activate target
+		graphMu.Lock()
+		for i := range graph.Nodes {
+			if graph.Nodes[i].Status == "active" {
+				graph.Nodes[i].Status = "inactive"
+			}
+			if graph.Nodes[i].NodeID == body.NodeID {
+				graph.Nodes[i].Status = "active"
+			}
+		}
+		graphMu.Unlock()
+
+		if err := saveGraph(repoRoot); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save graph"})
+			return
+		}
+
+		go broadcastGraph()
+
+		c.JSON(http.StatusOK, gin.H{
+			"status":       "switched",
+			"node_id":      targetNode.NodeID,
+			"worktree_path": targetNode.WorktreePath,
+			"git_hash":     targetNode.GitHash,
+		})
+	})
+
 	// ── GET /ws WebSocket Endpoint ────────────────────────────────────────────
 
 	r.GET("/ws", func(c *gin.Context) {

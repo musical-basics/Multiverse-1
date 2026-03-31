@@ -5,12 +5,14 @@ import ReactFlow, {
   MiniMap,
   useNodesState,
   useEdgesState,
+  addEdge,
 } from 'reactflow';
-import type { Node, Edge } from 'reactflow';
+import type { Node, Edge, Connection } from 'reactflow';
 import 'reactflow/dist/style.css';
 import CommitNode from './CommitNode';
 import { buildGraphElements } from './layout';
 import AgentHaltToast from './AgentHaltToast';
+import IntentModal from './IntentModal';
 
 const DAEMON_URL = 'http://localhost:4444';
 const WS_URL = 'ws://localhost:4444/ws';
@@ -31,6 +33,7 @@ export default function App() {
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge[]>([]);
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [agentHalt, setAgentHalt] = useState<{ visible: boolean; error?: string }>({ visible: false });
+  const [pendingBranch, setPendingBranch] = useState<{ sourceNodeId: string; sourceHash: string } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
   // Scrap It: POST /reset → git reset --hard
@@ -42,6 +45,48 @@ export default function App() {
       console.error('Reset failed:', e);
     }
   };
+
+  // onConnect: when user drags an edge from a node to empty space → show IntentModal
+  const onConnect = useCallback((connection: Connection) => {
+    // Standard edge connection — only show modal when user explicitly triggers branch
+    setEdges((eds) => addEdge({ ...connection, animated: true, style: { stroke: '#4ade80', strokeWidth: 2 } }, eds));
+  }, [setEdges]);
+
+  // Double-click node → Time Travel (POST /switch)
+  const onNodeDoubleClick = useCallback(async (_: React.MouseEvent, node: Node) => {
+    try {
+      const res = await fetch(`${DAEMON_URL}/switch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ node_id: node.id }),
+      });
+      if (!res.ok) throw new Error('switch failed');
+      const data = await res.json() as { worktree_path?: string };
+      console.log('Time Travel → switched to', data.worktree_path);
+    } catch (e) {
+      console.error('Time Travel failed:', e);
+    }
+  }, []);
+
+  // Create branch: POST /branch then dismiss modal
+  const handleCreateBranch = useCallback(async (intent: string) => {
+    if (!pendingBranch) return;
+    try {
+      await fetch(`${DAEMON_URL}/branch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source_hash: pendingBranch.sourceHash,
+          parent_id: pendingBranch.sourceNodeId,
+          new_intent: intent,
+        }),
+      });
+    } catch (e) {
+      console.error('Branch creation failed:', e);
+    } finally {
+      setPendingBranch(null);
+    }
+  }, [pendingBranch]);
 
   const applyGraph = useCallback((graphData: { nodes: unknown[] }) => {
     if (!graphData?.nodes) return;
@@ -177,6 +222,8 @@ export default function App() {
         edges={edges}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
+        onConnect={onConnect}
+        onNodeDoubleClick={onNodeDoubleClick}
         nodeTypes={nodeTypes}
         fitView
         fitViewOptions={{ padding: 0.3 }}
@@ -205,12 +252,24 @@ export default function App() {
         />
       )}
 
-      {/* Dev helper: expose triggerHalt on window for testing */}
+      {/* Dev helpers */}
       {import.meta.env.DEV && (() => {
         // @ts-ignore
         window.__multiverseHalt = (msg?: string) => setAgentHalt({ visible: true, error: msg });
+        // @ts-ignore — expose branch trigger for testing
+        window.__multiverseBranch = (nodeId: string, hash: string) => setPendingBranch({ sourceNodeId: nodeId, sourceHash: hash });
         return null;
       })()}
+
+      {/* Intent Modal (branch creation) */}
+      {pendingBranch && (
+        <IntentModal
+          sourceNodeId={pendingBranch.sourceNodeId}
+          sourceHash={pendingBranch.sourceHash}
+          onConfirm={handleCreateBranch}
+          onCancel={() => setPendingBranch(null)}
+        />
+      )}
     </div>
   );
 }
