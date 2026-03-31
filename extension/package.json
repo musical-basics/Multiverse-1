@@ -1,18 +1,38 @@
 {
-  "name": "extension",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "name": "multiverse-vc",
+  "displayName": "Multiverse VC",
+  "description": "AI-native version control for vibe coders — Figma-style branching, time travel, and context sandboxing",
+  "version": "0.1.0",
+  "publisher": "multiverse-vc",
+  "engines": {
+    "vscode": "^1.85.0"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "packageManager": "pnpm@10.27.0",
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "multiverse.openCanvas",
+        "title": "Multiverse VC: Open Canvas"
+      },
+      {
+        "command": "multiverse.initialize",
+        "title": "Multiverse VC: Initialize Repository"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "watch": "tsc -watch -p tsconfig.json"
+  },
   "devDependencies": {
-    "@types/node": "^25.5.0",
-    "@vscode/vsce": "^3.7.1",
-    "typescript": "^6.0.2"
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.110.0",
+    "typescript": "^5.4.0"
   }
 }
