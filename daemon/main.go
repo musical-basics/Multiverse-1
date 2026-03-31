@@ -206,7 +206,80 @@ func main() {
 		c.JSON(http.StatusOK, graph)
 	})
 
-	// ── WebSocket Endpoint ────────────────────────────────────────────────────
+	// ── POST /snapshot — git add . && git commit -m "{prompt}" ─────────────────
+
+	r.POST("/snapshot", func(c *gin.Context) {
+		var body struct {
+			Prompt string `json:"prompt"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil || body.Prompt == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "prompt is required"})
+			return
+		}
+
+		// Stage all changes
+		if out, err := executeGit(repoRoot, "add", "."); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "git add failed", "detail": out})
+			return
+		}
+
+		// Commit with intent prompt as message
+		if out, err := executeGit(repoRoot, "commit", "-m", body.Prompt); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "git commit failed", "detail": out})
+			return
+		}
+
+		hash, err := currentHash(repoRoot)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read commit hash"})
+			return
+		}
+
+		// Find parent node (last active node)
+		parentID := ""
+		graphMu.RLock()
+		for i := len(graph.Nodes) - 1; i >= 0; i-- {
+			if graph.Nodes[i].Status == "active" {
+				parentID = graph.Nodes[i].NodeID
+				break
+			}
+		}
+		graphMu.RUnlock()
+
+		// Create new node
+		newNode := MultiverseNode{
+			NodeID:       uuid.NewString(),
+			GitHash:      hash,
+			ParentID:     parentID,
+			IntentPrompt: body.Prompt,
+			Timestamp:    time.Now().UTC().Format(time.RFC3339),
+			WorktreePath: repoRoot,
+			Status:       "active",
+		}
+
+		if err := addNode(repoRoot, newNode); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save node"})
+			return
+		}
+
+		// Broadcast updated graph to all canvas clients
+		go broadcastGraph()
+
+		c.JSON(http.StatusOK, newNode)
+	})
+
+	// ── POST /reset — git reset --hard (scrap dirty state) ───────────────────
+
+	r.POST("/reset", func(c *gin.Context) {
+		if out, err := executeGit(repoRoot, "reset", "--hard"); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "git reset failed", "detail": out})
+			return
+		}
+		hash, _ := currentHash(repoRoot)
+		c.JSON(http.StatusOK, gin.H{"status": "reset", "head": hash})
+	})
+
+	// ── GET /ws WebSocket Endpoint ────────────────────────────────────────────
 
 	r.GET("/ws", func(c *gin.Context) {
 		ws, err := upgrader.Upgrade(c.Writer, c.Request, nil)

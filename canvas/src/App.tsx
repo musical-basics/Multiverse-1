@@ -10,6 +10,7 @@ import type { Node, Edge } from 'reactflow';
 import 'reactflow/dist/style.css';
 import CommitNode from './CommitNode';
 import { buildGraphElements } from './layout';
+import AgentHaltToast from './AgentHaltToast';
 
 const DAEMON_URL = 'http://localhost:4444';
 const WS_URL = 'ws://localhost:4444/ws';
@@ -29,7 +30,18 @@ export default function App() {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node[]>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge[]>([]);
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
+  const [agentHalt, setAgentHalt] = useState<{ visible: boolean; error?: string }>({ visible: false });
   const wsRef = useRef<WebSocket | null>(null);
+
+  // Scrap It: POST /reset → git reset --hard
+  const handleScrap = async () => {
+    try {
+      await fetch(`${DAEMON_URL}/reset`, { method: 'POST' });
+      setAgentHalt({ visible: false });
+    } catch (e) {
+      console.error('Reset failed:', e);
+    }
+  };
 
   const applyGraph = useCallback((graphData: { nodes: unknown[] }) => {
     if (!graphData?.nodes) return;
@@ -94,7 +106,7 @@ export default function App() {
   const cfg = STATUS_CONFIG[status];
 
   return (
-    <div style={{ width: '100vw', height: '100vh', background: 'linear-gradient(135deg, #0f0f14 0%, #1a1a24 100%)' }}>
+    <div style={{ width: '100vw', height: '100vh', background: 'linear-gradient(135deg, #0f0f14 0%, #1a1a24 100%)', position: 'relative' }}>
       {/* Status bar */}
       <div
         style={{
@@ -182,6 +194,23 @@ export default function App() {
           maskColor="rgba(15,15,20,0.7)"
         />
       </ReactFlow>
+
+      {/* Agent Halt Toast */}
+      {agentHalt.visible && (
+        <AgentHaltToast
+          error={agentHalt.error}
+          onFix={() => setAgentHalt({ visible: false })}
+          onScrap={handleScrap}
+          onDismiss={() => setAgentHalt({ visible: false })}
+        />
+      )}
+
+      {/* Dev helper: expose triggerHalt on window for testing */}
+      {import.meta.env.DEV && (() => {
+        // @ts-ignore
+        window.__multiverseHalt = (msg?: string) => setAgentHalt({ visible: true, error: msg });
+        return null;
+      })()}
     </div>
   );
 }
